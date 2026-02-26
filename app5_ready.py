@@ -7,11 +7,13 @@ Rakendus loeb tokeneid ja arvutab jooksvat kulu.
 """
 
 import os
+import csv
 import pickle
 import streamlit as st
 import pandas as pd
 import numpy as np
 import tiktoken
+from datetime import datetime
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -39,6 +41,22 @@ except Exception:
 # ──────────────────────────────────────────────────────────────
 # Abifunktsioonid
 # ──────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────
+# Tagasiside logimise funktsioon
+# ──────────────────────────────────────────────────────────────
+
+def log_feedback(timestamp, prompt, filters, context_ids, context_names, response, rating, error_category):
+    """Salvesta tagasiside CSV-faili."""
+    file_path = 'tagasiside_log.csv'
+    file_exists = os.path.isfile(file_path)
+    
+    with open(file_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Aeg', 'Kasutaja päring', 'Filtrid', 'Leitud ID-d', 'Leitud ained', 'LLM Vastus', 'Hinnang', 'Veatüüp'])
+        writer.writerow([timestamp, prompt, filters, str(context_ids), str(context_names), response, rating, error_category])
+
 
 def count_tokens(text: str) -> int:
     """Loe tokenite arv tiktoken'iga; tagavarana ≈ 1 token / 4 tähemärki."""
@@ -299,11 +317,55 @@ JUHISED:
 
 
 # ──────────────────────────────────────────────────────────────
-# Vestluse kuvamine
+# Vestluse kuvamine koos kapotialuse info ja tagasiside vormidega
 # ──────────────────────────────────────────────────────────────
-for msg in st.session_state.messages:
+for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        
+        # Debug info ja tagasiside ainult assistendi sõnumitele
+        if msg["role"] == "assistant" and "debug_info" in msg:
+            debug = msg["debug_info"]
+            
+            # 1. Kapoti all (RAG andmed JA süsteemiviip)
+            with st.expander("🔍 Vaata kapoti alla (RAG ja filtrid)"):
+                st.caption(f"**Aktiivsed filtrid:** {debug.get('filters', 'Info puudub')}")
+                st.write(f"Filtrid jätsid andmestikku alles **{debug.get('filtered_count', 0)}** kursust.")
+                
+                st.write("**RAG otsingu tulemus (Top 5 leitud kursust):**")
+                ctx_df = debug.get('context_df')
+                if ctx_df is not None and not ctx_df.empty:
+                    display_cols = ['unique_ID', 'nimi_et', 'eap', 'semester', 'oppeaste', 'score']
+                    cols_to_show = [c for c in display_cols if c in ctx_df.columns]
+                    st.dataframe(ctx_df[cols_to_show], hide_index=True)
+                else:
+                    st.warning("Ühtegi kursust ei leitud (kas filtrid olid liiga karmid või andmestik tühi).")
+                
+                st.text_area(
+                    "LLM-ile saadetud täpne prompt:", 
+                    debug.get('system_prompt', ''), 
+                    height=150, 
+                    disabled=True, 
+                    key=f"prompt_area_{i}"
+                )
+            
+            # 2. Tagasiside kogumine
+            with st.expander("📝 Hinda vastust (Salvestab logisse)"):
+                with st.form(key=f"feedback_form_{i}"):
+                    rating = st.radio("Hinnang vastusele:", ["👍 Hea", "👎 Halb"], horizontal=True, key=f"rating_{i}")
+                    error_step = st.selectbox(
+                        "Kui vastus oli halb, siis mis läks valesti?", 
+                        ["", "Filtrid olid liiga karmid/valed", "Otsing leidis valed ained (RAG viga)", "LLM hallutsineeris/vastas valesti"],
+                        key=f"error_step_{i}"
+                    )
+                    if st.form_submit_button("Salvesta hinnang"):
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        ctx_df = debug.get('context_df')
+                        ctx_ids = ctx_df['unique_ID'].tolist() if (ctx_df is not None and not ctx_df.empty and 'unique_ID' in ctx_df.columns) else []
+                        ctx_names = ctx_df['nimi_et'].tolist() if (ctx_df is not None and not ctx_df.empty and 'nimi_et' in ctx_df.columns) else []
+                        
+                        log_feedback(ts, debug.get('user_prompt', ''), debug.get('filters', ''), ctx_ids, ctx_names, msg["content"], rating, error_step)
+                        st.success("Tagasiside salvestatud tagasiside_log.csv faili!")
 
 # ──────────────────────────────────────────────────────────────
 # Kasutaja sisend → RAG → LLM vastus → järelvestlus
@@ -320,6 +382,9 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
             st.error(err)
             st.session_state.messages.append({"role": "assistant", "content": err})
         else:
+            # Aktiivsete filtrite kirjeldus logimiseks
+            current_filters_str = f"EAP:{selected_eap}, Sem:{selected_semester}, Keel:{selected_keel}, Linn:{selected_linn}, Aste:{selected_oppeaste}, Vorm:{selected_veebiope}, Hind:{selected_hindamisviis}"
+
             # ── 1. Filtreerimine ──────────────────────────────
             with st.spinner("Rakendan filtreid ja otsin kursusi …"):
                 filtered_df = apply_filters(df_raw)
@@ -359,7 +424,10 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
                 "role": "system",
                 "content": build_system_prompt(context_text, n_filtered),
             }
-            messages_to_send = [system_msg] + st.session_state.messages
+            messages_to_send = [system_msg] + [
+                {"role": m["role"], "content": m["content"]} 
+                for m in st.session_state.messages
+            ]
 
             # Sisendtokenite arv
             input_tokens = messages_to_token_count(messages_to_send)
@@ -393,10 +461,24 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
                 st.session_state.total_output_tokens += output_tokens
                 st.session_state.total_cost += msg_cost
 
-                # Salvesta vastus ajalukku
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": response_text}
-                )
+                # Koosta debug info tabel (ilma embedding veeruta)
+                results_df_display = results.drop(columns=['embedding'], errors='ignore').copy() if not results.empty else pd.DataFrame()
+                
+                # Koosta süsteemiviip tekst debug jaoks
+                system_prompt_text = build_system_prompt(context_text, n_filtered)
+
+                # Salvesta vastus ajalukku koos debug infoga
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response_text,
+                    "debug_info": {
+                        "user_prompt": prompt,
+                        "filters": current_filters_str,
+                        "filtered_count": n_filtered,
+                        "context_df": results_df_display,
+                        "system_prompt": system_prompt_text
+                    }
+                })
 
                 # Kuva (selle vastuse) tokenite info
                 st.caption(
@@ -407,6 +489,7 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
                     f"~{st.session_state.total_output_tokens:,} out / "
                     f"${st.session_state.total_cost:.6f}"
                 )
+                st.rerun()
 
             except Exception as e:
                 st.error(f"Viga LLM-i päringul: {e}")
