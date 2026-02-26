@@ -19,3 +19,4 @@ dependencies:
       - langchain-community
       - python-dotenv
       - watchdog
+      - tiktoken
