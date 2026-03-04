@@ -1,18 +1,15 @@
 """
-🎓 AI Kursuse Nõustaja – RAG + metaandmete filtreerimine + järelvestlus
-=========================================================================
-Variant B: kasutaja valib metaandmete filtrid Streamlit'i külgribalt.
-Pärast RAG-otsingu tulemusi saab vestlust jätkata (nt küsida leitud ainete kohta).
+🎓 TÜ Kursuse Nõustaja – RAG + hübriidotsing + metaandmete filtreerimine + järelvestlus
+=========================================================================================
+Kasutaja valib metaandmete filtrid Streamlit'i külgribalt.
+Pärast hübriidotsingu (semantiline + võtmesõna) tulemusi saab vestlust jätkata.
 Rakendus loeb tokeneid ja arvutab jooksvat kulu.
 """
 
 import os
-import csv
 import pickle
 import streamlit as st
 import pandas as pd
-import numpy as np
-import tiktoken
 from datetime import datetime
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
@@ -20,7 +17,16 @@ from dotenv import load_dotenv
 
 # Lae .env fail, kui see eksisteerib
 load_dotenv()
-from sklearn.metrics.pairwise import cosine_similarity
+
+from utils import (
+    count_tokens,
+    messages_to_token_count,
+    log_feedback,
+    apply_filters,
+    hybrid_search,
+    build_system_prompt,
+    calculate_cost,
+)
 
 # ──────────────────────────────────────────────────────────────
 # Konfiguratsioon
@@ -32,62 +38,18 @@ LLM_MODEL = "google/gemma-3-27b-it"
 TOP_K = 5
 
 # Hinnang: OpenRouter google/gemma-3-27b-it
-# (free tier = $0; tasuline tier ≈ $0.10/1M input, $0.20/1M output).
 COST_PER_1M_INPUT_TOKENS = 0.10   # USD
 COST_PER_1M_OUTPUT_TOKENS = 0.20  # USD
-
-# tiktoken tokenizer (cl100k_base sobib enamikele mudelitele)
-try:
-    _ENC = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    _ENC = None
-
-# ──────────────────────────────────────────────────────────────
-# Abifunktsioonid
-# ──────────────────────────────────────────────────────────────
-
-# ──────────────────────────────────────────────────────────────
-# Tagasiside logimise funktsioon
-# ──────────────────────────────────────────────────────────────
-
-def log_feedback(timestamp, prompt, filters, context_ids, context_names, response, rating, error_category):
-    """Salvesta tagasiside CSV-faili."""
-    file_path = 'tagasiside_log.csv'
-    file_exists = os.path.isfile(file_path)
-    
-    with open(file_path, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(['Aeg', 'Kasutaja päring', 'Filtrid', 'Leitud ID-d', 'Leitud ained', 'LLM Vastus', 'Hinnang', 'Veatüüp'])
-        writer.writerow([timestamp, prompt, filters, str(context_ids), str(context_names), response, rating, error_category])
-
-
-def count_tokens(text: str) -> int:
-    """Loe tokenite arv tiktoken'iga; tagavarana ≈ 1 token / 4 tähemärki."""
-    if _ENC is not None:
-        return len(_ENC.encode(text))
-    return max(1, len(text) // 4)
-
-
-def messages_to_token_count(messages: list[dict]) -> int:
-    """Arvuta sõnumite nimekirja kogu tokenite arv."""
-    total = 0
-    for m in messages:
-        total += 4                                   # role + formatting overhead
-        total += count_tokens(m.get("content", ""))
-    total += 2                                       # lõpetav token
-    return total
-
 
 # ──────────────────────────────────────────────────────────────
 # Lehe seadistus
 # ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI Kursuse Nõustaja", page_icon="🎓", layout="wide"
+    page_title="TÜ Kursuse Nõustaja", page_icon="🎓", layout="wide"
 )
-st.title("🎓 AI Kursuse Nõustaja")
+st.title("🎓 TÜ Kursuse Nõustaja")
 st.caption(
-    "RAG süsteem koos metaandmete filtreerimise ja järelvestlusega  ·  Variant B"
+    "Hübriidotsing (semantiline + võtmesõna) koos metaandmete filtreerimise ja järelvestlusega"
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -107,7 +69,6 @@ def load_data_and_embeddings():
         with open(EMBEDDINGS_PATH, "rb") as f:
             embeddings = pickle.load(f)
     else:
-        # Esimene käivitus – arvutab vektorid (~1-2 min)
         _embedder = load_embedder()
         texts = []
         for _, row in df.iterrows():
@@ -145,7 +106,7 @@ if "last_results_df" not in st.session_state:
     st.session_state.last_results_df = None
 
 # ──────────────────────────────────────────────────────────────
-# Külgriba: API-võti · filtrid · tokenite info
+# Külgriba: API-võti · filtrid · otsingu seaded · tokenite info
 # ──────────────────────────────────────────────────────────────
 with st.sidebar:
     # Lae API võti: .env failist või käsitsi sisestades
@@ -180,7 +141,7 @@ with st.sidebar:
     linn_options = sorted(df_raw["linn"].dropna().unique().tolist())
     selected_linn = st.multiselect("Linn", linn_options)
 
-    # Õppeaste (välja väärtus võib olla mitme komaga eraldatud)
+    # Õppeaste
     oppeaste_flat: set[str] = set()
     for vals in df_raw["oppeaste"].dropna().unique():
         for v in str(vals).split(","):
@@ -208,6 +169,20 @@ with st.sidebar:
         df_raw["hindamisviis"].dropna().unique().tolist()
     )
     selected_hindamisviis = st.multiselect("Hindamisviis", hindamisviis_options)
+
+    st.divider()
+    st.subheader("⚙️ Otsingu seaded")
+    semantic_weight = st.slider(
+        "Semantilise otsingu kaal",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.7,
+        step=0.1,
+        help="Suurem väärtus eelistab tähenduslikku (vektori-) otsingut. "
+             "Väiksem väärtus eelistab täpset võtmesõna otsingut.",
+    )
+    keyword_weight = round(1.0 - semantic_weight, 2)
+    st.caption(f"Võtmesõnaotsingu kaal: **{keyword_weight}**")
 
     st.divider()
     st.subheader("💰 Tokenid ja kulu")
@@ -315,154 +290,45 @@ with st.sidebar:
         st.caption("Vaata lühikest õppevideot tehisintellektist:")
         st.video("https://www.youtube.com/watch?v=ad79nYk2keg")
 
-
-# ──────────────────────────────────────────────────────────────
-# Filtreerimisloogika
-# ──────────────────────────────────────────────────────────────
-
-def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    """Rakenda külgriba filtrid andmetabelile."""
-    mask = pd.Series(True, index=df.index)
-
-    if selected_semester:
-        mask &= df["semester"].isin(selected_semester)
-    if selected_keel:
-        mask &= df["keel"].isin(selected_keel)
-    if selected_linn:
-        mask &= df["linn"].isin(selected_linn)
-    if selected_oppeaste:
-        mask &= df["oppeaste"].apply(
-            lambda x: any(opt in str(x) for opt in selected_oppeaste)
-            if pd.notna(x)
-            else False
-        )
-    if selected_veebiope:
-        mask &= df["veebiope"].isin(selected_veebiope)
-    if selected_hindamisviis:
-        mask &= df["hindamisviis"].isin(selected_hindamisviis)
-    mask &= (df["eap"] >= selected_eap[0]) & (df["eap"] <= selected_eap[1])
-
-    return df[mask]
-
-
-# ──────────────────────────────────────────────────────────────
-# Semantiline otsing
-# ──────────────────────────────────────────────────────────────
-
-def semantic_search(query: str, filtered_indices: pd.Index, top_k: int = TOP_K):
-    """Vektorotsing filtreeritud alamhulgal."""
-    if len(filtered_indices) == 0:
-        return pd.DataFrame(), "Ühtegi kursust ei vasta filtritele."
-
-    idx_positions = [df_raw.index.get_loc(i) for i in filtered_indices]
-    filtered_embeddings = embeddings_matrix[idx_positions]
-
-    query_vec = embedder.encode([query])[0]
-    scores = cosine_similarity([query_vec], filtered_embeddings)[0]
-
-    filtered_df = df_raw.loc[filtered_indices].copy()
-    filtered_df["score"] = scores
-    results = filtered_df.sort_values("score", ascending=False).head(top_k)
-
-    # Koosta konteksttekst LLM-ile
-    display_cols = [c for c in results.columns if c != "score"]
-    context_rows = []
-    for _, row in results.iterrows():
-        parts = []
-        for col in display_cols:
-            val = row[col]
-            if pd.notna(val):
-                parts.append(f"{col}: {val}")
-        context_rows.append("\n".join(parts))
-    context_text = "\n\n---\n\n".join(context_rows)
-
-    return results, context_text
-
-
-# ──────────────────────────────────────────────────────────────
-# Süsteemiprompt
-# ──────────────────────────────────────────────────────────────
-
-def build_system_prompt(context_text: str, n_filtered: int) -> str:
-    """Koosta süsteemiprompt aktiivsetest filtritest ja otsingutulemustega."""
-    active_filters = []
-    if selected_semester:
-        active_filters.append(f"Semester: {', '.join(selected_semester)}")
-    if selected_keel:
-        active_filters.append(f"Õppekeel: {', '.join(selected_keel)}")
-    if selected_linn:
-        active_filters.append(f"Linn: {', '.join(selected_linn)}")
-    if selected_oppeaste:
-        active_filters.append(f"Õppeaste: {', '.join(selected_oppeaste)}")
-    if selected_veebiope:
-        active_filters.append(f"Õppevorm: {', '.join(selected_veebiope)}")
-    if selected_hindamisviis:
-        active_filters.append(f"Hindamisviis: {', '.join(selected_hindamisviis)}")
-    if selected_eap != (eap_min_val, eap_max_val):
-        active_filters.append(f"EAP: {selected_eap[0]}–{selected_eap[1]}")
-
-    filter_info = (
-        "\n".join(active_filters) if active_filters else "Filtreid pole rakendatud."
-    )
-
-    return f"""Oled Tartu Ülikooli ainekursuste nõustaja-vestlusbot.
-
-AKTIIVSED FILTRID (kasutaja valinud):
-{filter_info}
-
-Filtritele vastas kokku {n_filtered} kursust. Semantilise otsingu alusel parimad {TOP_K} vastet:
-
-{context_text}
-
-JUHISED:
-- Vasta ALATI eesti keeles (v.a juhul, kui kasutaja kirjutab inglise keeles).
-- Kasuta ülaltoodud otsingutulemusi oma vastuse alusena.
-- Kui otsingutulemused on tühjad, ütle, et pole sobivaid aineid leitud, ja soovita filtreid laiendada.
-- Kirjelda soovitatud aineid lühidalt ja selgita, miks need kasutaja küsimusele vastavad.
-- Kui kasutaja küsib lisainfot konkreetse leitud aine kohta, anna seda tulemuste põhjal.
-- Ära leiuta infot, mida otsingutulemused ei sisalda.
-- Kui kasutaja küsib midagi, mis ei puutu kursustesse, ütle viisakalt, et saad aidata ainult kursuste leidmisel."""
-
-
 # ──────────────────────────────────────────────────────────────
 # Vestluse kuvamine koos kapotialuse info ja tagasiside vormidega
 # ──────────────────────────────────────────────────────────────
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        
+
         # Debug info ja tagasiside ainult assistendi sõnumitele
         if msg["role"] == "assistant" and "debug_info" in msg:
             debug = msg["debug_info"]
-            
+
             # 1. Kapoti all (RAG andmed JA süsteemiviip)
             with st.expander("🔍 Vaata kapoti alla (RAG ja filtrid)"):
                 st.caption(f"**Aktiivsed filtrid:** {debug.get('filters', 'Info puudub')}")
                 st.write(f"Filtrid jätsid andmestikku alles **{debug.get('filtered_count', 0)}** kursust.")
-                
-                st.write("**RAG otsingu tulemus (Top 5 leitud kursust):**")
+
+                st.write("**Hübriidotsingu tulemus (Top 5 leitud kursust):**")
                 ctx_df = debug.get('context_df')
                 if ctx_df is not None and not ctx_df.empty:
-                    display_cols = ['unique_ID', 'nimi_et', 'eap', 'semester', 'oppeaste', 'score']
+                    display_cols = ['unique_ID', 'nimi_et', 'eap', 'semester', 'oppeaste', 'score', 'sem_score', 'kw_score']
                     cols_to_show = [c for c in display_cols if c in ctx_df.columns]
                     st.dataframe(ctx_df[cols_to_show], hide_index=True)
                 else:
                     st.warning("Ühtegi kursust ei leitud (kas filtrid olid liiga karmid või andmestik tühi).")
-                
+
                 st.text_area(
-                    "LLM-ile saadetud täpne prompt:", 
-                    debug.get('system_prompt', ''), 
-                    height=150, 
-                    disabled=True, 
+                    "LLM-ile saadetud täpne prompt:",
+                    debug.get('system_prompt', ''),
+                    height=150,
+                    disabled=True,
                     key=f"prompt_area_{i}"
                 )
-            
+
             # 2. Tagasiside kogumine
             with st.expander("📝 Hinda vastust (Salvestab logisse)"):
                 with st.form(key=f"feedback_form_{i}"):
                     rating = st.radio("Hinnang vastusele:", ["👍 Hea", "👎 Halb"], horizontal=True, key=f"rating_{i}")
                     error_step = st.selectbox(
-                        "Kui vastus oli halb, siis mis läks valesti?", 
+                        "Kui vastus oli halb, siis mis läks valesti?",
                         ["", "Filtrid olid liiga karmid/valed", "Otsing leidis valed ained (RAG viga)", "LLM hallutsineeris/vastas valesti"],
                         key=f"error_step_{i}"
                     )
@@ -471,12 +337,11 @@ for i, msg in enumerate(st.session_state.messages):
                         ctx_df = debug.get('context_df')
                         ctx_ids = ctx_df['unique_ID'].tolist() if (ctx_df is not None and not ctx_df.empty and 'unique_ID' in ctx_df.columns) else []
                         ctx_names = ctx_df['nimi_et'].tolist() if (ctx_df is not None and not ctx_df.empty and 'nimi_et' in ctx_df.columns) else []
-                        
                         log_feedback(ts, debug.get('user_prompt', ''), debug.get('filters', ''), ctx_ids, ctx_names, msg["content"], rating, error_step)
                         st.success("Tagasiside salvestatud tagasiside_log.csv faili!")
 
 # ──────────────────────────────────────────────────────────────
-# Kasutaja sisend → RAG → LLM vastus → järelvestlus
+# Kasutaja sisend → hübriidotsing → LLM vastus → järelvestlus
 # ──────────────────────────────────────────────────────────────
 
 if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
@@ -495,12 +360,28 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
 
             # ── 1. Filtreerimine ──────────────────────────────
             with st.spinner("Rakendan filtreid ja otsin kursusi …"):
-                filtered_df = apply_filters(df_raw)
+                filtered_df = apply_filters(
+                    df_raw,
+                    selected_semester=selected_semester,
+                    selected_keel=selected_keel,
+                    selected_linn=selected_linn,
+                    selected_oppeaste=selected_oppeaste,
+                    selected_veebiope=selected_veebiope,
+                    selected_hindamisviis=selected_hindamisviis,
+                    selected_eap=selected_eap,
+                )
                 n_filtered = len(filtered_df)
 
-                # ── 2. Semantiline otsing ─────────────────────
-                results, context_text = semantic_search(
-                    prompt, filtered_df.index
+                # ── 2. Hübriidotsing ─────────────────────────
+                results, context_text = hybrid_search(
+                    query=prompt,
+                    df_raw=df_raw,
+                    embeddings_matrix=embeddings_matrix,
+                    embedder=embedder,
+                    filtered_indices=filtered_df.index,
+                    top_k=TOP_K,
+                    semantic_weight=semantic_weight,
+                    keyword_weight=keyword_weight,
                 )
                 st.session_state.last_results_df = results
 
@@ -514,7 +395,7 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
                     show_cols = [
                         "aine_kood", "nimi_et", "nimi_en", "eap",
                         "semester", "keel", "linn", "oppeaste",
-                        "veebiope", "score",
+                        "veebiope", "score", "sem_score", "kw_score",
                     ]
                     show_cols = [c for c in show_cols if c in results.columns]
                     st.dataframe(
@@ -528,12 +409,26 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
                 )
 
             # ── 3. LLM vastus ────────────────────────────────
+            system_prompt_text = build_system_prompt(
+                context_text=context_text,
+                n_filtered=n_filtered,
+                top_k=TOP_K,
+                selected_semester=selected_semester,
+                selected_keel=selected_keel,
+                selected_linn=selected_linn,
+                selected_oppeaste=selected_oppeaste,
+                selected_veebiope=selected_veebiope,
+                selected_hindamisviis=selected_hindamisviis,
+                selected_eap=selected_eap,
+                eap_min_val=eap_min_val,
+                eap_max_val=eap_max_val,
+            )
             system_msg = {
                 "role": "system",
-                "content": build_system_prompt(context_text, n_filtered),
+                "content": system_prompt_text,
             }
             messages_to_send = [system_msg] + [
-                {"role": m["role"], "content": m["content"]} 
+                {"role": m["role"], "content": m["content"]}
                 for m in st.session_state.messages
             ]
 
@@ -556,35 +451,26 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
                 output_tokens = count_tokens(response_text)
 
                 # Kulu
-                input_cost = (
-                    input_tokens * COST_PER_1M_INPUT_TOKENS / 1_000_000
-                )
-                output_cost = (
-                    output_tokens * COST_PER_1M_OUTPUT_TOKENS / 1_000_000
-                )
-                msg_cost = input_cost + output_cost
+                cost = calculate_cost(input_tokens, output_tokens, COST_PER_1M_INPUT_TOKENS, COST_PER_1M_OUTPUT_TOKENS)
 
                 # Uuenda kumulatiivseid loendureid
                 st.session_state.total_input_tokens += input_tokens
                 st.session_state.total_output_tokens += output_tokens
-                st.session_state.total_cost += msg_cost
+                st.session_state.total_cost += cost["total_cost"]
 
-                # Koosta debug info tabel (ilma embedding veeruta)
+                # Koosta debug info tabel
                 results_df_display = results.drop(columns=['embedding'], errors='ignore').copy() if not results.empty else pd.DataFrame()
-                
-                # Koosta süsteemiviip tekst debug jaoks
-                system_prompt_text = build_system_prompt(context_text, n_filtered)
 
                 # Salvesta vastus ajalukku koos debug infoga
                 st.session_state.messages.append({
-                    "role": "assistant", 
+                    "role": "assistant",
                     "content": response_text,
                     "debug_info": {
                         "user_prompt": prompt,
                         "filters": current_filters_str,
                         "filtered_count": n_filtered,
                         "context_df": results_df_display,
-                        "system_prompt": system_prompt_text
+                        "system_prompt": system_prompt_text,
                     }
                 })
 
@@ -592,7 +478,7 @@ if prompt := st.chat_input("Kirjelda, mida soovid õppida …"):
                 st.caption(
                     f"📊 ~{input_tokens:,} sisendtokenit · "
                     f"~{output_tokens:,} väljundtokenit · "
-                    f"kulu ~${msg_cost:.6f}  |  "
+                    f"kulu ~${cost['total_cost']:.6f}  |  "
                     f"Kokku: ~{st.session_state.total_input_tokens:,} in / "
                     f"~{st.session_state.total_output_tokens:,} out / "
                     f"${st.session_state.total_cost:.6f}"
